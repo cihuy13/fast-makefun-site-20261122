@@ -15,22 +15,11 @@ let _dateCache = new Map();
 
 // ---------------------------------------------------------------- text
 
+const ESC_RE = /[&<>"']/g;
+const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
 function escapeHtml(text) {
-  let start = 0;
-  let out = '';
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    let e;
-    if (c === 38) e = '&amp;';
-    else if (c === 60) e = '&lt;';
-    else if (c === 62) e = '&gt;';
-    else if (c === 34) e = '&quot;';
-    else if (c === 39) e = '&#39;';
-    else continue;
-    out += text.slice(start, i) + e;
-    start = i + 1;
-  }
-  return start === 0 ? text : out + text.slice(start);
+  return text.replace(ESC_RE, (c) => ESC[c]);
 }
 
 const SLUG_MAX = 64;
@@ -359,25 +348,26 @@ const WS_RE = /\s/;
 
 function inline(s, env) {
   const out = [];
-  let plain = '';
+  let seg = 0; // start of the current plain-text segment
   let i = 0;
   const n = s.length;
   while (i < n) {
     const c = s.charCodeAt(i);
     if (c === 92 && i + 1 < n && isEscapableCode(s.charCodeAt(i + 1))) {
-      if (plain !== '') { out.push(escapeHtml(plain)); plain = ''; }
+      if (i > seg) out.push(escapeHtml(s.slice(seg, i)));
       out.push(escapeHtml(s[i + 1]));
       i += 2;
+      seg = i;
       continue;
     }
     if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) {
-        if (plain !== '') { out.push(escapeHtml(plain)); plain = ''; }
+        if (i > seg) out.push(escapeHtml(s.slice(seg, i)));
         out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
         i = j + 1;
+        seg = i;
       } else {
-        plain += '`';
         i++;
       }
       continue;
@@ -386,22 +376,22 @@ function inline(s, env) {
       if (s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2);
         if (j > i + 2) {
-          if (plain !== '') { out.push(escapeHtml(plain)); plain = ''; }
+          if (i > seg) out.push(escapeHtml(s.slice(seg, i)));
           out.push('<strong>', inline(s.slice(i + 2, j), env), '</strong>');
           i = j + 2;
+          seg = i;
         } else {
-          plain += '**';
           i += 2;
         }
         continue;
       }
       const j = findSingleStar(s, i + 1);
       if (j > i + 1) {
-        if (plain !== '') { out.push(escapeHtml(plain)); plain = ''; }
+        if (i > seg) out.push(escapeHtml(s.slice(seg, i)));
         out.push('<em>', inline(s.slice(i + 1, j), env), '</em>');
         i = j + 1;
+        seg = i;
       } else {
-        plain += '*';
         i++;
       }
       continue;
@@ -411,19 +401,18 @@ function inline(s, env) {
       const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
       if (target !== '' && !WS_RE.test(target)) {
-        if (plain !== '') { out.push(escapeHtml(plain)); plain = ''; }
+        if (i > seg) out.push(escapeHtml(s.slice(seg, i)));
         out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(i + 1, k), env), '</a>');
         i = m + 1;
+        seg = i;
         continue;
       }
-      plain += '[';
       i++;
       continue;
     }
-    plain += s[i];
     i++;
   }
-  if (plain !== '') out.push(escapeHtml(plain));
+  if (n > seg) out.push(escapeHtml(s.slice(seg, n)));
   return out.join('');
 }
 
@@ -662,6 +651,56 @@ function renderNodes(nodes, scope, ctx, depth) {
   return out.join('');
 }
 
+// Compile a parsed template tree into a render function. Same semantics as
+// renderNodes below (kept as the fallback): scope-chain lookup, truthiness,
+// for/if/include with the 8-deep include limit. Codegen removes the per-node
+// dispatch and the intermediate string joins at render time.
+function compileTemplate(nodes) {
+  let uid = 0;
+  function gen(list, sv) {
+    let code = '';
+    for (const n of list) {
+      switch (n.kind) {
+        case 'text':
+          code += `out+=${JSON.stringify(n.text)};`;
+          break;
+        case 'var':
+          code += `out+=escape(textOf(L(${sv},${JSON.stringify(n.path)})));`;
+          break;
+        case 'raw':
+          code += `out+=textOf(L(${sv},${JSON.stringify(n.path)}));`;
+          break;
+        case 'if':
+          code += `if(truthy(L(${sv},${JSON.stringify(n.path)}))!==${n.not}){`;
+          code += gen(n.then, sv);
+          code += '}';
+          if (n.else !== null) {
+            code += 'else{';
+            code += gen(n.else, sv);
+            code += '}';
+          }
+          break;
+        case 'for': {
+          const id = ++uid;
+          const nsv = `s${id}`;
+          code += `{const x${id}=L(${sv},${JSON.stringify(n.path)});if(Array.isArray(x${id})){for(let k${id}=0;k${id}<x${id}.length;k${id}++){const ${nsv}={vars:{${n.name}:x${id}[k${id}],loop:{index:k${id}+1,first:k${id}===0,last:k${id}===x${id}.length-1,length:x${id}.length}},parent:${sv}};`;
+          code += gen(n.body, nsv);
+          code += '}}}';
+          break;
+        }
+        case 'include': {
+          const id = ++uid;
+          code += `{const t${id}=templates.get(${JSON.stringify(n.name)});if(t${id}!==undefined&&depth<8)out+=t${id}(${sv},templates,escape,depth+1);}`;
+          break;
+        }
+      }
+    }
+    return code;
+  }
+  const factory = new Function('L', 'textOf', 'truthy', `return function(scope,templates,escape,depth){let out="";${gen(nodes, 'scope')}return out;}`);
+  return factory(lookup, textOf, truthy);
+}
+
 // ---------------------------------------------------------------- build
 
 const RESERVED = ['posts', 'tags', 'page'];
@@ -730,7 +769,7 @@ export function build(input) {
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -863,10 +902,9 @@ export function build(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escape: escapeHtml };
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    const fn = templates.get(name);
+    return fn === undefined ? null : fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, templates, escapeHtml, 0);
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, cards) });
   const per = input.site.per_page;
